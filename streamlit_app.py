@@ -1,6 +1,7 @@
 import datetime
 import os
-from typing import Optional
+import re
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import snowflake.connector
@@ -18,7 +19,47 @@ SNOWFLAKE_REQUIRED_FIELDS = [
 ]
 
 
-def get_snowflake_credentials() -> dict:
+def _translate_query_for_session(query: str) -> str:
+    return re.sub(r"%\(([^)]+)\)s", r":\1", query)
+
+
+class StreamlitSnowflakeCursor:
+    def __init__(self, session: Any):
+        self._session = session
+        self._last_result = None
+
+    def __enter__(self) -> "StreamlitSnowflakeCursor":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        return None
+
+    def execute(self, query: str, params: Optional[Dict[str, Any]] = None) -> "StreamlitSnowflakeCursor":
+        translated_query = _translate_query_for_session(query)
+        if params:
+            self._last_result = self._session.sql(translated_query, **params)
+        else:
+            self._last_result = self._session.sql(translated_query)
+        return self
+
+    def fetch_pandas_all(self) -> pd.DataFrame:
+        if self._last_result is None:
+            return pd.DataFrame()
+        return self._last_result.to_pandas()
+
+
+class StreamlitSnowflakeConnection:
+    def __init__(self, session: Any):
+        self._session = session
+
+    def cursor(self) -> StreamlitSnowflakeCursor:
+        return StreamlitSnowflakeCursor(self._session)
+
+    def session(self) -> Any:
+        return self._session
+
+
+def get_snowflake_credentials() -> Dict[str, Any]:
     if SNOWFLAKE_SECRET_KEY in st.secrets:
         credentials = st.secrets[SNOWFLAKE_SECRET_KEY]
         source = "Streamlit secrets"
@@ -56,6 +97,15 @@ def get_snowflake_credentials() -> dict:
 
 
 def get_snowflake_connection():
+    try:
+        cnx = st.connection("snowflake")
+        if hasattr(cnx, "cursor"):
+            return cnx
+        if hasattr(cnx, "session"):
+            return StreamlitSnowflakeConnection(cnx.session())
+    except Exception:
+        pass
+
     creds = get_snowflake_credentials()
 
     return snowflake.connector.connect(
