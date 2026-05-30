@@ -48,7 +48,18 @@ streamlit run streamlit_app.py
 
 ## Streamlit Cloud / deployment
 
-For deployment on Streamlit Cloud, add the same `snowflake` secret keys in the app settings. The repo can be launched directly from `streamlit_app.py`.
+For deployment on Streamlit Cloud, add the same `snowflake` secret keys in the app settings using a `[snowflake]` secret group.
+
+If your deployment environment does not support Streamlit secrets, you can also provide credentials through environment variables:
+
+- `SNOWFLAKE_USER`
+- `SNOWFLAKE_PASSWORD`
+- `SNOWFLAKE_ACCOUNT`
+- `SNOWFLAKE_WAREHOUSE`
+- `SNOWFLAKE_DATABASE`
+- `SNOWFLAKE_SCHEMA`
+
+The app will use Streamlit secrets first and fall back to environment variables if the secrets group is not available.
 
 ## Snowflake schema
 

@@ -1,4 +1,5 @@
 import datetime
+import os
 from typing import Optional
 
 import pandas as pd
@@ -7,22 +8,63 @@ import streamlit as st
 
 
 SNOWFLAKE_SECRET_KEY = "snowflake"
+SNOWFLAKE_REQUIRED_FIELDS = [
+    "user",
+    "password",
+    "account",
+    "warehouse",
+    "database",
+    "schema",
+]
 
 
-def get_snowflake_connection():
-    if SNOWFLAKE_SECRET_KEY not in st.secrets:
+def get_snowflake_credentials() -> dict:
+    if SNOWFLAKE_SECRET_KEY in st.secrets:
+        credentials = st.secrets[SNOWFLAKE_SECRET_KEY]
+        source = "Streamlit secrets"
+    else:
+        credentials = {
+            "user": os.getenv("SNOWFLAKE_USER"),
+            "password": os.getenv("SNOWFLAKE_PASSWORD"),
+            "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+            "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+            "database": os.getenv("SNOWFLAKE_DATABASE"),
+            "schema": os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC"),
+        }
+        source = "environment variables"
+
+    missing_fields = [
+        field for field in SNOWFLAKE_REQUIRED_FIELDS if not credentials.get(field)
+    ]
+
+    if missing_fields:
         st.error(
-            "Snowflake credentials are missing. Add them to Streamlit secrets as described in README."
+            "Snowflake credentials are missing. "
+            "Set all required values in Streamlit secrets or environment variables."
+        )
+        st.error(
+            f"Missing fields: {', '.join(missing_fields)}. "
+            f"Configured via {source}."
+        )
+        st.markdown(
+            "**Local development:** create `.streamlit/secrets.toml` with a `[snowflake]` group. "
+            "**Deployment:** add the same `snowflake` secret group in Streamlit app settings or set the `SNOWFLAKE_*` environment variables."
         )
         st.stop()
 
+    return credentials
+
+
+def get_snowflake_connection():
+    creds = get_snowflake_credentials()
+
     return snowflake.connector.connect(
-        user=st.secrets[SNOWFLAKE_SECRET_KEY]["user"],
-        password=st.secrets[SNOWFLAKE_SECRET_KEY]["password"],
-        account=st.secrets[SNOWFLAKE_SECRET_KEY]["account"],
-        warehouse=st.secrets[SNOWFLAKE_SECRET_KEY]["warehouse"],
-        database=st.secrets[SNOWFLAKE_SECRET_KEY]["database"],
-        schema=st.secrets[SNOWFLAKE_SECRET_KEY]["schema"],
+        user=creds["user"],
+        password=creds["password"],
+        account=creds["account"],
+        warehouse=creds["warehouse"],
+        database=creds["database"],
+        schema=creds["schema"],
     )
 
 
