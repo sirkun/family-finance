@@ -32,6 +32,16 @@ TRANSACTION_TYPE_INCOME = 1
 TRANSACTION_TYPE_EXPENSE = 2
 TRANSACTION_TYPE_TRANSFER = 3
 
+# Account type constants (Vietnamese)
+ACCOUNT_TYPE_DEFAULT = 1  # Mặc định
+ACCOUNT_TYPE_DEBIT_CARD = 2  # thẻ ghi nợ
+ACCOUNT_TYPE_CREDIT_CARD = 3  # Thẻ tín dụng (nợ) - debt, should be negative in totals
+ACCOUNT_TYPE_VIRTUAL = 4  # Tài khoản ảo
+ACCOUNT_TYPE_INVESTMENT = 5  # Đầu tư
+ACCOUNT_TYPE_DEBT = 7  # Tôi nợ (nợ) - debt, should be negative in totals
+# NOTE: Account types 3 (CREDIT_CARD) and 7 (DEBT) represent liabilities and should be subtracted
+# from total balance calculations. Handle via is_not_include_in_total_balance flag or negate balance.
+
 
 def _translate_query_for_session(query: str) -> str:
     return re.sub(r"%\(([^)]+)\)s", r":\1", query)
@@ -296,18 +306,23 @@ def _ensure_accounts_table():
     if not _table_exists("ACCOUNTS"):
         execute_query(
             get_connection().cursor(),
-            "CREATE TABLE IF NOT EXISTS accounts (id STRING PRIMARY KEY, name STRING, account_type STRING, currency STRING, balance FLOAT, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
+            "CREATE TABLE IF NOT EXISTS accounts (id STRING PRIMARY KEY, name STRING, account_type STRING, currency STRING, balance FLOAT, is_not_include_in_total_balance BOOLEAN DEFAULT FALSE, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
         )
         return
 
     current_type = _get_column_type("ACCOUNTS", "ID")
     if current_type in ("STRING", "TEXT", "VARCHAR", "CHAR"):
+        # ensure is_not_include_in_total_balance column exists
+        if _get_column_type("ACCOUNTS", "IS_NOT_INCLUDE_IN_TOTAL_BALANCE") is None:
+            def _add_balance_exclude_flag(cur: Any):
+                cur.execute("ALTER TABLE accounts ADD COLUMN is_not_include_in_total_balance BOOLEAN DEFAULT FALSE")
+            run_migration_once("add_accounts_is_not_include_in_total_balance", _add_balance_exclude_flag)
         return
 
     _migrate_table_to_string_id(
         "ACCOUNTS",
-        "CREATE TABLE accounts_new (id STRING PRIMARY KEY, name STRING, account_type STRING, currency STRING, balance FLOAT, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
-        "INSERT INTO accounts_new (id, name, account_type, currency, balance, created_at) SELECT TO_VARCHAR(id), name, account_type, currency, TRY_TO_DOUBLE(balance), created_at FROM accounts",
+        "CREATE TABLE accounts_new (id STRING PRIMARY KEY, name STRING, account_type STRING, currency STRING, balance FLOAT, is_not_include_in_total_balance BOOLEAN DEFAULT FALSE, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
+        "INSERT INTO accounts_new (id, name, account_type, currency, balance, is_not_include_in_total_balance, created_at) SELECT TO_VARCHAR(id), name, account_type, currency, TRY_TO_DOUBLE(balance), FALSE, created_at FROM accounts",
     )
 
 
@@ -368,12 +383,17 @@ def sync_account_row(row: Dict[str, Any]) -> None:
     if account_id is None:
         return
 
+    # Extract is_not_include_in_total_balance from API (default to False)
+    is_not_include_raw = _api_get_value(row, ("is_not_include_in_total_balance", "isNotIncludeInTotalBalance", "not_include_in_total"), None)
+    is_not_include = bool(is_not_include_raw) if is_not_include_raw is not None else False
+
     params = {
         "id": account_id,
         "name": _api_get_value(row, ("name", "account_name", "accountName"), ""),
         "account_type": _api_get_value(row, ("type", "account_type", "accountType"), ""),
         "currency": _api_get_value(row, ("currency_code", "currencyCode", "currency"), ""),
         "balance": float(_api_get_value(row, ("currency_amount", "amount", "balance"), 0) or 0),
+        "is_not_include_in_total_balance": is_not_include,
         "created_at": _api_get_date(row, ("date_time", "add_time", "update_time", "created_at", "createdAt")),
     }
     query = """
@@ -385,6 +405,7 @@ def sync_account_row(row: Dict[str, Any]) -> None:
             %(account_type)s AS account_type,
             %(currency)s AS currency,
             %(balance)s::FLOAT AS balance,
+            %(is_not_include_in_total_balance)s::BOOLEAN AS is_not_include_in_total_balance,
             %(created_at)s::TIMESTAMP_LTZ AS created_at
     ) AS src
     ON tgt.id = src.id
@@ -392,9 +413,10 @@ def sync_account_row(row: Dict[str, Any]) -> None:
         name = src.name,
         account_type = src.account_type,
         currency = src.currency,
-        balance = src.balance
-    WHEN NOT MATCHED THEN INSERT (id, name, account_type, currency, balance, created_at)
-    VALUES (src.id, src.name, src.account_type, src.currency, src.balance, COALESCE(src.created_at, CURRENT_TIMESTAMP()))
+        balance = src.balance,
+        is_not_include_in_total_balance = src.is_not_include_in_total_balance
+    WHEN NOT MATCHED THEN INSERT (id, name, account_type, currency, balance, is_not_include_in_total_balance, created_at)
+    VALUES (src.id, src.name, src.account_type, src.currency, src.balance, src.is_not_include_in_total_balance, COALESCE(src.created_at, CURRENT_TIMESTAMP()))
     """
     with get_connection().cursor() as cur:
         execute_query(cur, query, params)
@@ -495,7 +517,7 @@ def sync_money_api_data() -> Dict[str, int]:
 @st.cache_data(ttl=300)
 def load_accounts() -> pd.DataFrame:
     query = """
-    SELECT id, name, account_type, currency, balance, created_at
+    SELECT id, name, account_type, currency, balance, is_not_include_in_total_balance, created_at
     FROM accounts
     ORDER BY name
     """
