@@ -27,6 +27,11 @@ MONEY_API_ENDPOINTS = {
     "transactions": f"{MONEY_API_BASE}/getTransactions",
 }
 
+# Transaction type constants
+TRANSACTION_TYPE_INCOME = 1
+TRANSACTION_TYPE_EXPENSE = 2
+TRANSACTION_TYPE_TRANSFER = 3
+
 
 def _translate_query_for_session(query: str) -> str:
     return re.sub(r"%\(([^)]+)\)s", r":\1", query)
@@ -172,11 +177,143 @@ def _api_post_form(url: str, data: Dict[str, Any]) -> Any:
     return payload
 
 
+_PYFORMAT_PARAM_RE = re.compile(r"%\(([^)]+)\)s")
+
+
 def _api_get_value(row: Dict[str, Any], keys: tuple, default: Any = None) -> Any:
     for key in keys:
         if key in row and row[key] not in (None, ""):
             return row[key]
     return default
+
+
+def _convert_pyformat_dict_to_qmarks(query: str, params: Dict[str, Any]) -> tuple[str, list[Any]]:
+    param_order: list[str] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        param_order.append(match.group(1))
+        return "?"
+
+    converted_query = _PYFORMAT_PARAM_RE.sub(_replace, query)
+    converted_params = [params[name] for name in param_order]
+    return converted_query, converted_params
+
+
+def execute_query(cur: Any, query: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    if params is None:
+        return cur.execute(query)
+
+    try:
+        return cur.execute(query, params)
+    except snowflake.connector.errors.ProgrammingError as exc:
+        if "Binding parameters must be a list" in str(exc) and isinstance(params, dict):
+            converted_query, converted_params = _convert_pyformat_dict_to_qmarks(query, params)
+            return cur.execute(converted_query, converted_params)
+        raise
+
+
+def _api_get_date(row: Dict[str, Any], keys: tuple) -> Optional[datetime.date]:
+    for key in keys:
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            if isinstance(value, str) and value.isdigit():
+                ts = int(value) / 1000
+                return datetime.datetime.utcfromtimestamp(ts).date()
+            if isinstance(value, (int, float)):
+                ts = int(value) / 1000
+                return datetime.datetime.utcfromtimestamp(ts).date()
+            return datetime.date.fromisoformat(value)
+        except Exception:
+            continue
+    return None
+
+
+def _table_exists(table_name: str) -> bool:
+    query = """
+    SELECT COUNT(*) AS count
+    FROM information_schema.tables
+    WHERE table_schema = CURRENT_SCHEMA()
+      AND table_name = %(table_name)s
+    """
+    with get_connection().cursor() as cur:
+        execute_query(cur, query, {"table_name": table_name.upper()})
+        return int(cur.fetch_pandas_all()["COUNT"].iloc[0]) > 0
+
+
+def _get_column_type(table_name: str, column_name: str) -> Optional[str]:
+    query = """
+    SELECT data_type
+    FROM information_schema.columns
+    WHERE table_schema = CURRENT_SCHEMA()
+      AND table_name = %(table_name)s
+      AND column_name = %(column_name)s
+    """
+    with get_connection().cursor() as cur:
+        execute_query(cur, query, {"table_name": table_name.upper(), "column_name": column_name.upper()})
+        df = cur.fetch_pandas_all()
+        if df.empty:
+            return None
+        return df["DATA_TYPE"].iloc[0].upper()
+
+
+def _migrate_table_to_string_id(table_name: str, create_sql: str, copy_sql: str) -> None:
+    temp_table = f"{table_name}_NEW"
+    with get_connection().cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {temp_table}")
+        cur.execute(create_sql)
+        execute_query(cur, copy_sql)
+        cur.execute(f"ALTER TABLE {table_name} RENAME TO {table_name}_OLD")
+        cur.execute(f"ALTER TABLE {temp_table} RENAME TO {table_name}")
+        cur.execute(f"DROP TABLE IF EXISTS {table_name}_OLD")
+
+
+def _ensure_accounts_table():
+    if not _table_exists("ACCOUNTS"):
+        execute_query(
+            get_connection().cursor(),
+            "CREATE TABLE IF NOT EXISTS accounts (id STRING PRIMARY KEY, name STRING, account_type STRING, currency STRING, balance FLOAT, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
+        )
+        return
+
+    current_type = _get_column_type("ACCOUNTS", "ID")
+    if current_type in ("STRING", "TEXT", "VARCHAR", "CHAR"):
+        return
+
+    _migrate_table_to_string_id(
+        "ACCOUNTS",
+        "CREATE TABLE accounts_new (id STRING PRIMARY KEY, name STRING, account_type STRING, currency STRING, balance FLOAT, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
+        "INSERT INTO accounts_new (id, name, account_type, currency, balance, created_at) SELECT TO_VARCHAR(id), name, account_type, currency, TRY_TO_DOUBLE(balance), created_at FROM accounts",
+    )
+
+
+def _ensure_transactions_table():
+    if not _table_exists("TRANSACTIONS"):
+        execute_query(
+            get_connection().cursor(),
+            "CREATE TABLE IF NOT EXISTS transactions (id STRING PRIMARY KEY, posted_at DATE, description STRING, category STRING, amount FLOAT, currency STRING, account_id STRING, from_account_id STRING, to_account_id STRING, transaction_type INTEGER, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
+        )
+        return
+
+    id_type = _get_column_type("TRANSACTIONS", "ID")
+    account_id_type = _get_column_type("TRANSACTIONS", "ACCOUNT_ID")
+    if id_type in ("STRING", "TEXT", "VARCHAR", "CHAR") and account_id_type in ("STRING", "TEXT", "VARCHAR", "CHAR"):
+        return
+
+    _migrate_table_to_string_id(
+        "TRANSACTIONS",
+        "CREATE TABLE transactions_new (id STRING PRIMARY KEY, posted_at DATE, description STRING, category STRING, amount FLOAT, currency STRING, account_id STRING, from_account_id STRING, to_account_id STRING, transaction_type INTEGER, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
+        "INSERT INTO transactions_new (id, posted_at, description, category, amount, currency, account_id, from_account_id, to_account_id, transaction_type, created_at) SELECT TO_VARCHAR(id), posted_at, description, category, TRY_TO_DOUBLE(amount), currency, TO_VARCHAR(account_id), TO_VARCHAR(NULL), TO_VARCHAR(NULL), NULL, created_at FROM transactions",
+    )
+
+
+def initialize_schema():
+    _ensure_accounts_table()
+    _ensure_transactions_table()
+    with get_connection().cursor() as cur:
+        cur.execute("CREATE TABLE IF NOT EXISTS budgets (id INTEGER AUTOINCREMENT PRIMARY KEY, category STRING, amount FLOAT, period STRING, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())")
+        cur.execute("CREATE TABLE IF NOT EXISTS sync_state (dataset STRING PRIMARY KEY, last_synced_at TIMESTAMP_LTZ, last_synced_id STRING, row_count NUMBER, updated_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())")
 
 
 def fetch_api_accounts() -> list[Dict[str, Any]]:
@@ -193,18 +330,6 @@ def fetch_api_transactions() -> list[Dict[str, Any]]:
     return raw if isinstance(raw, list) else []
 
 
-def initialize_schema():
-    commands = [
-        "CREATE TABLE IF NOT EXISTS accounts (id INTEGER AUTOINCREMENT PRIMARY KEY, name STRING, account_type STRING, currency STRING, balance FLOAT, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
-        "CREATE TABLE IF NOT EXISTS transactions (id INTEGER AUTOINCREMENT PRIMARY KEY, posted_at DATE, description STRING, category STRING, amount FLOAT, currency STRING, account_id INTEGER, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
-        "CREATE TABLE IF NOT EXISTS budgets (id INTEGER AUTOINCREMENT PRIMARY KEY, category STRING, amount FLOAT, period STRING, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
-        "CREATE TABLE IF NOT EXISTS sync_state (dataset STRING PRIMARY KEY, last_synced_at TIMESTAMP_LTZ, last_synced_id STRING, row_count NUMBER, updated_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
-    ]
-    with get_connection().cursor() as cur:
-        for command in commands:
-            cur.execute(command)
-
-
 def sync_account_row(row: Dict[str, Any]) -> None:
     account_id = _api_get_value(row, ("id", "account_id", "accountId"))
     if account_id is None:
@@ -215,14 +340,14 @@ def sync_account_row(row: Dict[str, Any]) -> None:
         "name": _api_get_value(row, ("name", "account_name", "accountName"), ""),
         "account_type": _api_get_value(row, ("type", "account_type", "accountType"), ""),
         "currency": _api_get_value(row, ("currency_code", "currencyCode", "currency"), ""),
-        "balance": float(_api_get_value(row, ("balance",), 0) or 0),
-        "created_at": _api_get_value(row, ("created_at", "createdAt"), None),
+        "balance": float(_api_get_value(row, ("currency_amount", "amount", "balance"), 0) or 0),
+        "created_at": _api_get_date(row, ("date_time", "add_time", "update_time", "created_at", "createdAt")),
     }
     query = """
     MERGE INTO accounts AS tgt
     USING (
         SELECT
-            %(id)s::INTEGER AS id,
+            %(id)s AS id,
             %(name)s AS name,
             %(account_type)s AS account_type,
             %(currency)s AS currency,
@@ -239,7 +364,7 @@ def sync_account_row(row: Dict[str, Any]) -> None:
     VALUES (src.id, src.name, src.account_type, src.currency, src.balance, COALESCE(src.created_at, CURRENT_TIMESTAMP()))
     """
     with get_connection().cursor() as cur:
-        cur.execute(query, params)
+        execute_query(cur, query, params)
 
 
 def sync_transaction_row(row: Dict[str, Any]) -> int:
@@ -247,36 +372,64 @@ def sync_transaction_row(row: Dict[str, Any]) -> int:
     if transaction_id is None:
         return 0
 
+    # transaction type: 1=income, 2=expense, 3=transfer
+    ttype_raw = _api_get_value(row, ("type",), None)
+    try:
+        transaction_type = int(ttype_raw) if ttype_raw is not None and str(ttype_raw).isdigit() else None
+    except Exception:
+        transaction_type = None
+
+    from_acc = _api_get_value(row, ("from_account_id", "fromAccountId"), None)
+    to_acc = _api_get_value(row, ("to_account_id", "toAccountId"), None)
+    if from_acc == "":
+        from_acc = None
+    if to_acc == "":
+        to_acc = None
+
+    # prefer account_id for simple mapping (non-transfer)
+    account_id = None
+    if transaction_type == TRANSACTION_TYPE_TRANSFER:
+        account_id = None
+    else:
+        account_id = from_acc or to_acc or _api_get_value(row, ("account_id", "accountId"), None)
+
     params = {
         "id": transaction_id,
-        "posted_at": _api_get_value(row, ("date", "posted_at", "postedAt"), None),
+        "posted_at": _api_get_date(row, ("date_time", "date", "posted_at", "postedAt", "add_time")),
         "description": _api_get_value(row, ("description", "remark", "note"), ""),
-        "category": _api_get_value(row, ("category", "category_name", "categoryName"), ""),
-        "amount": float(_api_get_value(row, ("amount",), 0) or 0),
-        "currency": _api_get_value(row, ("currency_code", "currencyCode", "currency"), ""),
-        "account_id": _api_get_value(row, ("account_id", "accountId"), None),
-        "created_at": _api_get_value(row, ("created_at", "createdAt"), None),
+        "category": _api_get_value(row, ("category", "category_name", "categoryName", "income_expenditure_category_id"), ""),
+        "amount": float(_api_get_value(row, ("amount", "foreign_currency_amount", "account_currency_amount"), 0) or 0),
+        "currency": _api_get_value(row, ("currency_code", "currencyCode", "currency", "foreign_currency_id", "account_currency_id"), ""),
+        "account_id": account_id,
+        "from_account_id": from_acc,
+        "to_account_id": to_acc,
+        "transaction_type": transaction_type,
+        "created_at": _api_get_date(row, ("date_time", "add_time", "update_time", "created_at", "createdAt")),
     }
 
     with get_connection().cursor() as cur:
-        cur.execute(
-            "SELECT 1 FROM transactions WHERE id = %(id)s::INTEGER",
+        execute_query(
+            cur,
+            "SELECT 1 FROM transactions WHERE id = %(id)s",
             {"id": params["id"]},
         )
         if cur.fetch_pandas_all().empty:
             insert_query = """
-            INSERT INTO transactions (id, posted_at, description, category, amount, currency, account_id, created_at)
+            INSERT INTO transactions (id, posted_at, description, category, amount, currency, account_id, from_account_id, to_account_id, transaction_type, created_at)
             SELECT
-                %(id)s::INTEGER,
+                %(id)s,
                 %(posted_at)s::DATE,
                 %(description)s,
                 %(category)s,
                 %(amount)s::FLOAT,
                 %(currency)s,
-                %(account_id)s::INTEGER,
+                %(account_id)s::STRING,
+                %(from_account_id)s::STRING,
+                %(to_account_id)s::STRING,
+                %(transaction_type)s::INTEGER,
                 COALESCE(%(created_at)s::TIMESTAMP_LTZ, CURRENT_TIMESTAMP())
             """
-            cur.execute(insert_query, params)
+            execute_query(cur, insert_query, params)
             return 1
     return 0
 
@@ -295,7 +448,8 @@ def sync_money_api_data() -> Dict[str, int]:
         synced_transactions += sync_transaction_row(row)
 
     with get_connection().cursor() as cur:
-        cur.execute(
+        execute_query(
+            cur,
             "MERGE INTO sync_state AS tgt USING (SELECT 'money_api' AS dataset) AS src ON tgt.dataset = src.dataset "
             "WHEN MATCHED THEN UPDATE SET last_synced_at = CURRENT_TIMESTAMP(), row_count = %(row_count)s, updated_at = CURRENT_TIMESTAMP() "
             "WHEN NOT MATCHED THEN INSERT (dataset, last_synced_at, row_count) VALUES ('money_api', CURRENT_TIMESTAMP(), %(row_count)s)",
@@ -318,10 +472,12 @@ def load_accounts() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
-def load_transactions(account_id: Optional[int] = None) -> pd.DataFrame:
+def load_transactions(account_id: Optional[str] = None, unassigned: bool = False) -> pd.DataFrame:
     conditions = []
     params = {}
-    if account_id is not None:
+    if unassigned:
+        conditions.append("t.account_id IS NULL")
+    elif account_id is not None:
         conditions.append("t.account_id = %(account_id)s")
         params["account_id"] = account_id
 
@@ -335,6 +491,9 @@ def load_transactions(account_id: Optional[int] = None) -> pd.DataFrame:
         t.amount,
         t.currency,
         a.name AS account_name,
+        t.from_account_id,
+        t.to_account_id,
+        t.transaction_type,
         t.created_at
     FROM transactions t
     LEFT JOIN accounts a ON t.account_id = a.id
@@ -343,7 +502,7 @@ def load_transactions(account_id: Optional[int] = None) -> pd.DataFrame:
     """
     with get_connection().cursor() as cur:
         if params:
-            cur.execute(query, params)
+            execute_query(cur, query, params)
         else:
             cur.execute(query)
         return cur.fetch_pandas_all()
@@ -367,7 +526,8 @@ def add_account(name: str, account_type: str, currency: str, balance: float):
     VALUES (%(name)s, %(account_type)s, %(currency)s, %(balance)s)
     """
     with get_connection().cursor() as cur:
-        cur.execute(
+        execute_query(
+            cur,
             query,
             {
                 "name": name,
@@ -386,14 +546,15 @@ def add_transaction(
     category: str,
     amount: float,
     currency: str,
-    account_id: int,
+    account_id: Optional[str],
 ):
     query = """
     INSERT INTO transactions (posted_at, description, category, amount, currency, account_id)
     VALUES (%(posted_at)s, %(description)s, %(category)s, %(amount)s, %(currency)s, %(account_id)s)
     """
     with get_connection().cursor() as cur:
-        cur.execute(
+        execute_query(
+            cur,
             query,
             {
                 "posted_at": posted_at,
@@ -414,7 +575,8 @@ def add_budget(category: str, amount: float, period: str):
     VALUES (%(category)s, %(amount)s, %(period)s)
     """
     with get_connection().cursor() as cur:
-        cur.execute(
+        execute_query(
+            cur,
             query,
             {"category": category, "amount": amount, "period": period},
         )
@@ -431,7 +593,7 @@ def show_dashboard():
     transactions = load_transactions()
     accounts = load_accounts()
 
-    total_balance = accounts["balance"].sum() if not accounts.empty else 0.0
+    total_balance = accounts["balance"].dropna().sum() if not accounts.empty else 0.0
     total_spend = transactions.loc[transactions["amount"] < 0, "amount"].sum() if not transactions.empty else 0.0
     total_income = transactions.loc[transactions["amount"] > 0, "amount"].sum() if not transactions.empty else 0.0
 
@@ -463,31 +625,36 @@ def show_dashboard():
 def show_transactions_page():
     st.header("Transactions")
     accounts = load_accounts()
-    account_options = {row["name"]: int(row["ID"]) for _, row in accounts.iterrows()} if not accounts.empty else {}
+    account_options = {row["name"]: row["ID"] for _, row in accounts.iterrows()} if not accounts.empty else {}
 
     with st.expander("Add new transaction"):
-        if accounts.empty:
-            st.warning("Create an account before adding transactions.")
-        else:
-            posted_at = st.date_input("Date", datetime.date.today())
-            description = st.text_input("Description")
-            category = st.text_input("Category", value="Groceries")
-            amount = st.number_input("Amount", value=0.0, format="%f")
-            currency = st.selectbox("Currency", options=sorted(accounts["currency"].unique()))
-            account_name = st.selectbox("Account", options=list(account_options.keys()))
-            if st.button("Save transaction"):
-                add_transaction(
-                    posted_at,
-                    description,
-                    category,
-                    amount,
-                    currency,
-                    account_options[account_name],
-                )
+        posted_at = st.date_input("Date", datetime.date.today())
+        description = st.text_input("Description")
+        category = st.text_input("Category", value="Groceries")
+        amount = st.number_input("Amount", value=0.0, format="%f")
+        currency_options = sorted(accounts["currency"].dropna().unique()) if not accounts.empty else ["USD"]
+        currency = st.selectbox("Currency", options=currency_options)
+        account_choices = ["Unassigned"] + list(account_options.keys())
+        account_name = st.selectbox("Account", options=account_choices)
+        if st.button("Save transaction"):
+            add_transaction(
+                posted_at,
+                description,
+                category,
+                amount,
+                currency,
+                None if account_name == "Unassigned" else account_options[account_name],
+            )
 
-    selected_account = st.selectbox("Filter by account", options=["All"] + list(account_options.keys()))
-    account_id = account_options[selected_account] if selected_account != "All" else None
-    transactions = load_transactions(account_id)
+    filter_options = ["All", "Unassigned"] + list(account_options.keys())
+    selected_account = st.selectbox("Filter by account", options=filter_options)
+    if selected_account == "All":
+        transactions = load_transactions()
+    elif selected_account == "Unassigned":
+        transactions = load_transactions(unassigned=True)
+    else:
+        transactions = load_transactions(account_options[selected_account])
+
     st.dataframe(transactions)
 
 
@@ -514,9 +681,9 @@ def show_accounts_page():
         st.dataframe(account_view)
 
         total_balance_by_currency = (
-            accounts.groupby("CURRENCY")["BALANCE"].sum().reset_index()
+            accounts.dropna(subset=["BALANCE"]).groupby("CURRENCY")["BALANCE"].sum().reset_index()
         )
-        overall_balance = accounts["BALANCE"].sum()
+        overall_balance = accounts["BALANCE"].dropna().sum()
 
         st.metric("Total balance", format_money(overall_balance))
         st.subheader("Balance by currency")
