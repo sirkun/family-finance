@@ -4,7 +4,7 @@ import os
 import re
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable
 
 import pandas as pd
 import snowflake.connector
@@ -258,6 +258,29 @@ def _get_column_type(table_name: str, column_name: str) -> Optional[str]:
         return df["DATA_TYPE"].iloc[0].upper()
 
 
+def _ensure_schema_migrations_table():
+    with get_connection().cursor() as cur:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (name STRING PRIMARY KEY, applied_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())"
+        )
+
+
+def run_migration_once(name: str, fn: Callable[[Any], None]) -> bool:
+    """Run a migration function once and record it in `schema_migrations`.
+
+    Returns True if migration ran, False if it was already applied.
+    """
+    _ensure_schema_migrations_table()
+    with get_connection().cursor() as cur:
+        execute_query(cur, "SELECT 1 FROM schema_migrations WHERE name = %(name)s", {"name": name})
+        if not cur.fetch_pandas_all().empty:
+            return False
+        # run migration function with the cursor
+        fn(cur)
+        execute_query(cur, "INSERT INTO schema_migrations (name) VALUES (%(name)s)", {"name": name})
+        return True
+
+
 def _migrate_table_to_string_id(table_name: str, create_sql: str, copy_sql: str) -> None:
     temp_table = f"{table_name}_NEW"
     with get_connection().cursor() as cur:
@@ -299,6 +322,16 @@ def _ensure_transactions_table():
     id_type = _get_column_type("TRANSACTIONS", "ID")
     account_id_type = _get_column_type("TRANSACTIONS", "ACCOUNT_ID")
     if id_type in ("STRING", "TEXT", "VARCHAR", "CHAR") and account_id_type in ("STRING", "TEXT", "VARCHAR", "CHAR"):
+        def _add_transfer_columns(cur: Any):
+            # Add columns if they don't exist to avoid SELECT compilation errors
+            if _get_column_type("TRANSACTIONS", "FROM_ACCOUNT_ID") is None:
+                cur.execute("ALTER TABLE transactions ADD COLUMN from_account_id STRING")
+            if _get_column_type("TRANSACTIONS", "TO_ACCOUNT_ID") is None:
+                cur.execute("ALTER TABLE transactions ADD COLUMN to_account_id STRING")
+            if _get_column_type("TRANSACTIONS", "TRANSACTION_TYPE") is None:
+                cur.execute("ALTER TABLE transactions ADD COLUMN transaction_type INTEGER")
+
+        run_migration_once("add_transactions_transfer_columns", _add_transfer_columns)
         return
 
     _migrate_table_to_string_id(
@@ -468,7 +501,8 @@ def load_accounts() -> pd.DataFrame:
     """
     with get_connection().cursor() as cur:
         cur.execute(query)
-        return cur.fetch_pandas_all()
+        df = cur.fetch_pandas_all()
+        return _normalize_df_columns(df)
 
 
 @st.cache_data(ttl=300)
@@ -505,7 +539,8 @@ def load_transactions(account_id: Optional[str] = None, unassigned: bool = False
             execute_query(cur, query, params)
         else:
             cur.execute(query)
-        return cur.fetch_pandas_all()
+        df = cur.fetch_pandas_all()
+        return _normalize_df_columns(df)
 
 
 @st.cache_data(ttl=300)
@@ -517,7 +552,8 @@ def load_budgets() -> pd.DataFrame:
     """
     with get_connection().cursor() as cur:
         cur.execute(query)
-        return cur.fetch_pandas_all()
+        df = cur.fetch_pandas_all()
+        return _normalize_df_columns(df)
 
 
 def add_account(name: str, account_type: str, currency: str, balance: float):
@@ -584,8 +620,16 @@ def add_budget(category: str, amount: float, period: str):
     st.success("Budget saved.")
 
 
-def format_money(value: float, currency: str = "USD") -> str:
+def format_money(value: float, currency: str = "VND") -> str:
     return f"{currency} {value:,.2f}"
+
+
+def _normalize_df_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    df.columns = [str(c).lower() for c in df.columns]
+    return df
 
 
 def show_dashboard():
@@ -611,7 +655,7 @@ def show_dashboard():
 
         monthly = (
             transactions.assign(posted_at=pd.to_datetime(transactions["posted_at"]))
-            .groupby(pd.Grouper(key="posted_at", freq="M"))["amount"]
+            .groupby(pd.Grouper(key="posted_at", freq="ME"))["amount"]
             .sum()
             .reset_index()
         )
@@ -632,7 +676,7 @@ def show_transactions_page():
         description = st.text_input("Description")
         category = st.text_input("Category", value="Groceries")
         amount = st.number_input("Amount", value=0.0, format="%f")
-        currency_options = sorted(accounts["currency"].dropna().unique()) if not accounts.empty else ["USD"]
+        currency_options = sorted(accounts["currency"].dropna().unique()) if not accounts.empty else ["VND"]
         currency = st.selectbox("Currency", options=currency_options)
         account_choices = ["Unassigned"] + list(account_options.keys())
         account_name = st.selectbox("Account", options=account_choices)
@@ -704,7 +748,7 @@ def show_accounts_page():
     with st.expander("Add account"):
         name = st.text_input("Account name")
         account_type = st.selectbox("Type", ["Savings", "Checking", "Credit", "Cash"])
-        currency = st.text_input("Currency", value="USD")
+        currency = st.text_input("Currency", value="VND")
         balance = st.number_input("Starting balance", value=0.0, format="%f")
         if st.button("Create account"):
             if not name:
