@@ -19,7 +19,8 @@ SNOWFLAKE_REQUIRED_FIELDS = [
     "schema",
 ]
 
-MONEY_API_TOKEN_KEY = "money_api"
+CONFIG_FILE = "config.json"
+MONEY_API_TOKEN_KEY = "money_api_token"
 MONEY_API_BASE = "https://money.quhou123.com/Api"
 MONEY_API_ENDPOINTS = {
     "accounts": f"{MONEY_API_BASE}/getAccounts",
@@ -75,6 +76,8 @@ def get_snowflake_credentials() -> Dict[str, Any]:
         "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
         "database": os.getenv("SNOWFLAKE_DATABASE"),
         "schema": os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC"),
+        "role": os.getenv("SNOWFLAKE_ROLE"),
+        "authenticator": os.getenv("SNOWFLAKE_AUTHENTICATOR"),
     }
 
     missing_fields = [
@@ -106,14 +109,21 @@ def get_snowflake_connection():
 
     creds = get_snowflake_credentials()
 
-    return snowflake.connector.connect(
-        user=creds["user"],
-        password=creds["password"],
-        account=creds["account"],
-        warehouse=creds["warehouse"],
-        database=creds["database"],
-        schema=creds["schema"],
-    )
+    connection_kwargs = {
+        "user": creds["user"],
+        "password": creds["password"],
+        "account": creds["account"],
+        "warehouse": creds["warehouse"],
+        "database": creds["database"],
+        "schema": creds["schema"],
+    }
+
+    if creds.get("role"):
+        connection_kwargs["role"] = creds["role"]
+    if creds.get("authenticator"):
+        connection_kwargs["authenticator"] = creds["authenticator"]
+
+    return snowflake.connector.connect(**connection_kwargs)
 
 
 @st.cache_resource
@@ -121,15 +131,23 @@ def get_connection():
     return get_snowflake_connection()
 
 
-def get_money_api_token() -> str:
-    if MONEY_API_TOKEN_KEY in st.secrets and "token" in st.secrets[MONEY_API_TOKEN_KEY]:
-        return st.secrets[MONEY_API_TOKEN_KEY]["token"]
+def load_config() -> Dict[str, Any]:
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as config_file:
+                return json.load(config_file)
+        except Exception as exc:
+            st.warning(f"Unable to read {CONFIG_FILE}: {exc}")
+    return {}
 
-    token = os.getenv("MONEY_API_TOKEN")
+
+def get_money_api_token() -> str:
+    config = load_config()
+    token = config.get(MONEY_API_TOKEN_KEY) or os.getenv("MONEY_API_TOKEN")
     if not token:
         st.error(
             "Money API token is missing. "
-            "Add `money_api.token` to Streamlit secrets or set the MONEY_API_TOKEN environment variable."
+            "Add `money_api_token` to config.json or set the MONEY_API_TOKEN environment variable."
         )
         st.stop()
     return token
