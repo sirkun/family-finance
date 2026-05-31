@@ -1,6 +1,9 @@
 import datetime
+import json
 import os
 import re
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, Optional
 
 import pandas as pd
@@ -17,6 +20,13 @@ SNOWFLAKE_REQUIRED_FIELDS = [
     "database",
     "schema",
 ]
+
+MONEY_API_TOKEN_KEY = "money_api"
+MONEY_API_BASE = "https://money.quhou123.com/Api"
+MONEY_API_ENDPOINTS = {
+    "accounts": f"{MONEY_API_BASE}/getAccounts",
+    "transactions": f"{MONEY_API_BASE}/getTransactions",
+}
 
 
 def _translate_query_for_session(query: str) -> str:
@@ -123,6 +133,172 @@ def get_connection():
     return get_snowflake_connection()
 
 
+def get_money_api_token() -> str:
+    if MONEY_API_TOKEN_KEY in st.secrets and "token" in st.secrets[MONEY_API_TOKEN_KEY]:
+        return st.secrets[MONEY_API_TOKEN_KEY]["token"]
+
+    token = os.getenv("MONEY_API_TOKEN")
+    if not token:
+        st.error(
+            "Money API token is missing. "
+            "Add `money_api.token` to Streamlit secrets or set the MONEY_API_TOKEN environment variable."
+        )
+        st.stop()
+    return token
+
+
+def _api_post_form(url: str, data: Dict[str, Any]) -> Any:
+    encoded = urllib.parse.urlencode(data).encode("utf-8")
+    request = urllib.request.Request(url, data=encoded, method="POST")
+    request.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = response.read().decode("utf-8")
+
+    payload = json.loads(body)
+    if isinstance(payload, dict) and payload.get("status") != 1:
+        raise RuntimeError(payload.get("msg", "Money API request failed"))
+
+    if isinstance(payload, dict):
+        for key in ("data", "result", "list", "items", "records"):
+            if key in payload:
+                return payload[key]
+    return payload
+
+
+def _api_get_value(row: Dict[str, Any], keys: tuple, default: Any = None) -> Any:
+    for key in keys:
+        if key in row and row[key] not in (None, ""):
+            return row[key]
+    return default
+
+
+def fetch_api_accounts() -> list[Dict[str, Any]]:
+    raw = _api_post_form(MONEY_API_ENDPOINTS["accounts"], {"token": get_money_api_token()})
+    if isinstance(raw, dict):
+        return raw.get("accounts") or raw.get("data") or raw.get("list") or []
+    return raw if isinstance(raw, list) else []
+
+
+def fetch_api_transactions() -> list[Dict[str, Any]]:
+    raw = _api_post_form(MONEY_API_ENDPOINTS["transactions"], {"token": get_money_api_token()})
+    if isinstance(raw, dict):
+        return raw.get("transactions") or raw.get("data") or raw.get("list") or []
+    return raw if isinstance(raw, list) else []
+
+
+def initialize_schema():
+    commands = [
+        "CREATE TABLE IF NOT EXISTS accounts (id INTEGER AUTOINCREMENT PRIMARY KEY, name STRING, account_type STRING, currency STRING, balance FLOAT, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
+        "CREATE TABLE IF NOT EXISTS transactions (id INTEGER AUTOINCREMENT PRIMARY KEY, posted_at DATE, description STRING, category STRING, amount FLOAT, currency STRING, account_id INTEGER, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
+        "CREATE TABLE IF NOT EXISTS budgets (id INTEGER AUTOINCREMENT PRIMARY KEY, category STRING, amount FLOAT, period STRING, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
+        "CREATE TABLE IF NOT EXISTS sync_state (dataset STRING PRIMARY KEY, last_synced_at TIMESTAMP_LTZ, last_synced_id STRING, row_count NUMBER, updated_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
+    ]
+    with get_connection().cursor() as cur:
+        for command in commands:
+            cur.execute(command)
+
+
+def sync_account_row(row: Dict[str, Any]) -> None:
+    account_id = _api_get_value(row, ("id", "account_id", "accountId"))
+    if account_id is None:
+        return
+
+    params = {
+        "id": account_id,
+        "name": _api_get_value(row, ("name", "account_name", "accountName"), ""),
+        "account_type": _api_get_value(row, ("type", "account_type", "accountType"), ""),
+        "currency": _api_get_value(row, ("currency_code", "currencyCode", "currency"), ""),
+        "balance": float(_api_get_value(row, ("balance",), 0) or 0),
+        "created_at": _api_get_value(row, ("created_at", "createdAt"), None),
+    }
+    query = """
+    MERGE INTO accounts AS tgt
+    USING (
+        SELECT
+            %(id)s::INTEGER AS id,
+            %(name)s AS name,
+            %(account_type)s AS account_type,
+            %(currency)s AS currency,
+            %(balance)s::FLOAT AS balance,
+            %(created_at)s::TIMESTAMP_LTZ AS created_at
+    ) AS src
+    ON tgt.id = src.id
+    WHEN MATCHED THEN UPDATE SET
+        name = src.name,
+        account_type = src.account_type,
+        currency = src.currency,
+        balance = src.balance
+    WHEN NOT MATCHED THEN INSERT (id, name, account_type, currency, balance, created_at)
+    VALUES (src.id, src.name, src.account_type, src.currency, src.balance, COALESCE(src.created_at, CURRENT_TIMESTAMP()))
+    """
+    with get_connection().cursor() as cur:
+        cur.execute(query, params)
+
+
+def sync_transaction_row(row: Dict[str, Any]) -> int:
+    transaction_id = _api_get_value(row, ("id", "transaction_id", "transactionId"))
+    if transaction_id is None:
+        return 0
+
+    params = {
+        "id": transaction_id,
+        "posted_at": _api_get_value(row, ("date", "posted_at", "postedAt"), None),
+        "description": _api_get_value(row, ("description", "remark", "note"), ""),
+        "category": _api_get_value(row, ("category", "category_name", "categoryName"), ""),
+        "amount": float(_api_get_value(row, ("amount",), 0) or 0),
+        "currency": _api_get_value(row, ("currency_code", "currencyCode", "currency"), ""),
+        "account_id": _api_get_value(row, ("account_id", "accountId"), None),
+        "created_at": _api_get_value(row, ("created_at", "createdAt"), None),
+    }
+
+    with get_connection().cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM transactions WHERE id = %(id)s::INTEGER",
+            {"id": params["id"]},
+        )
+        if cur.fetch_pandas_all().empty:
+            insert_query = """
+            INSERT INTO transactions (id, posted_at, description, category, amount, currency, account_id, created_at)
+            SELECT
+                %(id)s::INTEGER,
+                %(posted_at)s::DATE,
+                %(description)s,
+                %(category)s,
+                %(amount)s::FLOAT,
+                %(currency)s,
+                %(account_id)s::INTEGER,
+                COALESCE(%(created_at)s::TIMESTAMP_LTZ, CURRENT_TIMESTAMP())
+            """
+            cur.execute(insert_query, params)
+            return 1
+    return 0
+
+
+def sync_money_api_data() -> Dict[str, int]:
+    accounts = fetch_api_accounts()
+    transaction_rows = fetch_api_transactions()
+
+    synced_accounts = 0
+    for row in accounts:
+        sync_account_row(row)
+        synced_accounts += 1
+
+    synced_transactions = 0
+    for row in transaction_rows:
+        synced_transactions += sync_transaction_row(row)
+
+    with get_connection().cursor() as cur:
+        cur.execute(
+            "MERGE INTO sync_state AS tgt USING (SELECT 'money_api' AS dataset) AS src ON tgt.dataset = src.dataset "
+            "WHEN MATCHED THEN UPDATE SET last_synced_at = CURRENT_TIMESTAMP(), row_count = %(row_count)s, updated_at = CURRENT_TIMESTAMP() "
+            "WHEN NOT MATCHED THEN INSERT (dataset, last_synced_at, row_count) VALUES ('money_api', CURRENT_TIMESTAMP(), %(row_count)s)",
+            {"row_count": synced_accounts + synced_transactions},
+        )
+
+    return {"accounts_synced": synced_accounts, "transactions_inserted": synced_transactions}
+
+
 @st.cache_data(ttl=300)
 def load_accounts() -> pd.DataFrame:
     query = """
@@ -174,17 +350,6 @@ def load_budgets() -> pd.DataFrame:
     with get_connection().cursor() as cur:
         cur.execute(query)
         return cur.fetch_pandas_all()
-
-
-def initialize_schema():
-    commands = [
-        "CREATE TABLE IF NOT EXISTS accounts (id INTEGER AUTOINCREMENT PRIMARY KEY, name STRING, account_type STRING, currency STRING, balance FLOAT, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
-        "CREATE TABLE IF NOT EXISTS transactions (id INTEGER AUTOINCREMENT PRIMARY KEY, posted_at DATE, description STRING, category STRING, amount FLOAT, currency STRING, account_id INTEGER, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
-        "CREATE TABLE IF NOT EXISTS budgets (id INTEGER AUTOINCREMENT PRIMARY KEY, category STRING, amount FLOAT, period STRING, created_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())",
-    ]
-    with get_connection().cursor() as cur:
-        for command in commands:
-            cur.execute(command)
 
 
 def add_account(name: str, account_type: str, currency: str, balance: float):
@@ -370,13 +535,34 @@ def show_budgets_page():
             add_budget(category, amount, period)
 
 
+def show_data_sync_page():
+    st.header("Money API Sync")
+    st.write("Initialize Snowflake tables and import account/transaction data from the external Money API.")
+
+    if st.button("Run import now"):
+        try:
+            initialize_schema()
+            stats = sync_money_api_data()
+            st.success(
+                f"Sync complete: {stats['accounts_synced']} account rows processed, "
+                f"{stats['transactions_inserted']} new transactions inserted."
+            )
+            st.cache_data.clear()
+        except Exception as exc:
+            st.error("Money API sync failed.")
+            st.error(str(exc))
+
+
 def main():
     st.set_page_config(page_title="Family Finance", page_icon="💰", layout="wide")
     st.title("Family Finance Manager")
 
     initialize_schema()
 
-    page = st.sidebar.selectbox("Choose page", ["Dashboard", "Transactions", "Accounts", "Budgets"])
+    page = st.sidebar.selectbox(
+        "Choose page",
+        ["Dashboard", "Transactions", "Accounts", "Budgets", "Money API Sync"],
+    )
     if page == "Dashboard":
         show_dashboard()
     elif page == "Transactions":
@@ -385,6 +571,8 @@ def main():
         show_accounts_page()
     elif page == "Budgets":
         show_budgets_page()
+    elif page == "Money API Sync":
+        show_data_sync_page()
 
 
 if __name__ == "__main__":
