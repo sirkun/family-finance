@@ -342,7 +342,10 @@ def load_transactions(account_id: Optional[int] = None) -> pd.DataFrame:
     ORDER BY t.posted_at DESC
     """
     with get_connection().cursor() as cur:
-        cur.execute(query, params)
+        if params:
+            cur.execute(query, params)
+        else:
+            cur.execute(query)
         return cur.fetch_pandas_all()
 
 
