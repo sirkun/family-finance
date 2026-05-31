@@ -561,14 +561,17 @@ def show_budgets_page():
 
 def show_data_sync_page():
     st.header("Money API Sync")
-    st.write("Initialize Snowflake tables and import account/transaction data from the external Money API.")
+    st.write(
+        "Fetch the latest Money API data and sync it into the Snowflake tables we created: "
+        "`accounts`, `transactions`, and `sync_state`."
+    )
 
-    if st.button("Run import now"):
+    if st.button("Fetch Money API data"):
         try:
             initialize_schema()
             stats = sync_money_api_data()
             st.success(
-                f"Sync complete: {stats['accounts_synced']} account rows processed, "
+                f"Fetch complete: {stats['accounts_synced']} account rows processed, "
                 f"{stats['transactions_inserted']} new transactions inserted."
             )
             st.cache_data.clear()
