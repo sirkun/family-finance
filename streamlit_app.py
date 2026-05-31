@@ -744,7 +744,11 @@ def show_accounts_page():
             account_view = accounts
 
         st.subheader("Account view")
-        st.dataframe(account_view)
+        
+        styled_account_view = account_view.style.format({
+            "Amount": lambda val: format_money(val, "VND")
+        })
+        st.dataframe(styled_account_view, use_container_width=True)
 
         total_balance_by_currency = (
             accounts.dropna(subset=["BALANCE"]).groupby("CURRENCY")["BALANCE"].sum().reset_index()
