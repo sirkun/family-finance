@@ -726,50 +726,52 @@ def show_transactions_page():
 
 def show_accounts_page():
     st.header("Accounts")
-    accounts = load_accounts()
+accounts = load_accounts()
 
-    if accounts.empty:
-        st.info("No accounts found. Add a new account below to start tracking balances.")
+if accounts.empty:
+    st.info("No accounts found. Add a new account below to start tracking balances.")
+else:
+    # BƯỚC QUAN TRỌNG: Chuyển toàn bộ tên cột thành chữ thường.
+    # Dù gốc là "BALANCE", "Balance", hay "balance" thì đều biến thành "balance".
+    accounts.columns = accounts.columns.str.lower()
+
+    # Tạo bảng xem chi tiết tài khoản
+    if "name" in accounts.columns and "balance" in accounts.columns:
+        account_view = accounts[["name", "balance"]].rename(
+            columns={"name": "Name", "balance": "Amount"}
+        )
     else:
         account_view = accounts
-        if "NAME" in accounts.columns and "BALANCE" in accounts.columns:
-            account_view = accounts[["NAME", "BALANCE"]].rename(
-                columns={"NAME": "Name", "BALANCE": "Amount"}
-            )
-        elif "name" in accounts.columns and "balance" in accounts.columns:
-            account_view = accounts[["name", "balance"]].rename(
-                columns={"name": "Name", "balance": "Amount"}
-            )
-        else:
-            account_view = accounts
 
-        st.subheader("Account view")
-        
-        styled_account_view = account_view.style.format({
-            "Amount": lambda val: format_money(val, "VND")
-        })
-        st.dataframe(styled_account_view, use_container_width=True)
+    st.subheader("Account view")
+    
+    # Định dạng cột hiển thị tiền tệ
+    styled_account_view = account_view.style.format({
+        "Amount": lambda val: format_money(val, "VND")
+    })
+    st.dataframe(styled_account_view, use_container_width=True)
 
+    # Tính tổng số dư theo từng loại tiền tệ (đã an toàn với chữ thường)
+    if "currency" in accounts.columns and "balance" in accounts.columns:
         total_balance_by_currency = (
-            accounts.dropna(subset=["BALANCE"]).groupby("CURRENCY")["BALANCE"].sum().reset_index()
+            accounts.dropna(subset=["balance"])
+            .groupby("currency")["balance"]
+            .sum()
+            .reset_index()
         )
-        overall_balance = accounts["BALANCE"].dropna().sum()
-
-        st.metric("Total balance", format_money(overall_balance))
+        
+        # Định dạng tiền tệ cho cả bảng tổng hợp
+        styled_total = total_balance_by_currency.rename(
+            columns={"currency": "Currency", "balance": "Total balance"}
+        ).style.format({"Total balance": lambda val: format_money(val, "VND")})
+        
         st.subheader("Balance by currency")
-        st.dataframe(total_balance_by_currency.rename(columns={"CURRENCY": "Currency", "BALANCE": "Total balance"}))
-
-        st.subheader("Account details")
-        st.dataframe(
-            accounts[["ID", "NAME", "ACCOUNT_TYPE", "CURRENCY", "BALANCE"]]
-            .rename(columns={
-                "ID": "Account ID",
-                "NAME": "Name",
-                "ACCOUNT_TYPE": "Type",
-                "CURRENCY": "Currency",
-                "BALANCE": "Balance",
-            })
-        )
+        st.dataframe(styled_total, use_container_width=True)
+    
+    # Tính tổng số dư tất cả tài khoản
+    if "balance" in accounts.columns:
+        overall_balance = accounts["balance"].dropna().sum()
+        st.metric("Total balance", format_money(overall_balance))
 
     with st.expander("Add account"):
         name = st.text_input("Account name")
