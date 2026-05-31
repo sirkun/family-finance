@@ -10,8 +10,6 @@ import pandas as pd
 import snowflake.connector
 import streamlit as st
 
-
-SNOWFLAKE_SECRET_KEY = "snowflake"
 SNOWFLAKE_REQUIRED_FIELDS = [
     "user",
     "password",
@@ -70,19 +68,14 @@ class StreamlitSnowflakeConnection:
 
 
 def get_snowflake_credentials() -> Dict[str, Any]:
-    if SNOWFLAKE_SECRET_KEY in st.secrets:
-        credentials = st.secrets[SNOWFLAKE_SECRET_KEY]
-        source = "Streamlit secrets"
-    else:
-        credentials = {
-            "user": os.getenv("SNOWFLAKE_USER"),
-            "password": os.getenv("SNOWFLAKE_PASSWORD"),
-            "account": os.getenv("SNOWFLAKE_ACCOUNT"),
-            "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
-            "database": os.getenv("SNOWFLAKE_DATABASE"),
-            "schema": os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC"),
-        }
-        source = "environment variables"
+    credentials = {
+        "user": os.getenv("SNOWFLAKE_USER"),
+        "password": os.getenv("SNOWFLAKE_PASSWORD"),
+        "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+        "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+        "database": os.getenv("SNOWFLAKE_DATABASE"),
+        "schema": os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC"),
+    }
 
     missing_fields = [
         field for field in SNOWFLAKE_REQUIRED_FIELDS if not credentials.get(field)
@@ -91,15 +84,10 @@ def get_snowflake_credentials() -> Dict[str, Any]:
     if missing_fields:
         st.error(
             "Snowflake credentials are missing. "
-            "Set all required values in Streamlit secrets or environment variables."
+            "Set the required `SNOWFLAKE_*` environment variables."
         )
         st.error(
-            f"Missing fields: {', '.join(missing_fields)}. "
-            f"Configured via {source}."
-        )
-        st.markdown(
-            "**Local development:** create `.streamlit/secrets.toml` with a `[snowflake]` group. "
-            "**Deployment:** add the same `snowflake` secret group in Streamlit app settings or set the `SNOWFLAKE_*` environment variables."
+            f"Missing fields: {', '.join(missing_fields)}."
         )
         st.stop()
 
@@ -489,6 +477,21 @@ def show_accounts_page():
     if accounts.empty:
         st.info("No accounts found. Add a new account below to start tracking balances.")
     else:
+        account_view = accounts
+        if "NAME" in accounts.columns and "BALANCE" in accounts.columns:
+            account_view = accounts[["NAME", "BALANCE"]].rename(
+                columns={"NAME": "Name", "BALANCE": "Amount"}
+            )
+        elif "name" in accounts.columns and "balance" in accounts.columns:
+            account_view = accounts[["name", "balance"]].rename(
+                columns={"name": "Name", "balance": "Amount"}
+            )
+        else:
+            account_view = accounts
+
+        st.subheader("Account view")
+        st.dataframe(account_view)
+
         total_balance_by_currency = (
             accounts.groupby("CURRENCY")["BALANCE"].sum().reset_index()
         )
